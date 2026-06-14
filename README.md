@@ -636,7 +636,7 @@ pnpm --filter @open-design/<package> test
 gh pr create --fill
 ```
 
-Full agent-friendly contribution flow, code style, and PR bar → [`CONTRIBUTING.md`](CONTRIBUTING.md) ([Deutsch](docs/i18n/CONTRIBUTING.de.md) · [Français](docs/i18n/CONTRIBUTING.fr.md) · [简体中文](docs/i18n/CONTRIBUTING.zh-CN.md) · [日本語](docs/i18n/CONTRIBUTING.ja-JP.md) · [Português](docs/i18n/CONTRIBUTING.pt-BR.md)).
+Full agent-friendly contribution flow, code style, and PR bar → [`CONTRIBUTING.md`](CONTRIBUTING.md) ([Deutsch](docs/i18n/CONTRIBUTING.de.md) · [Français](docs/i18n/CONTRIBUTING.fr.md) · [简体中文](docs/i18n/CONTRIBUTING.zh-CN.md) · [日本語](docs/i18n/CONTRIBUTING.ja-JP.md) · [한국어](docs/i18n/CONTRIBUTING.ko.md) · [Português](docs/i18n/CONTRIBUTING.pt-BR.md) · [ภาษาไทย](docs/i18n/CONTRIBUTING.th.md)).
 
 ### 🏅 Open Design Fellow program
 

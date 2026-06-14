@@ -636,7 +636,7 @@ pnpm --filter @open-design/<package> test
 gh pr create --fill
 ```
 
-Contribution flow สำหรับ agent, code style และ PR bar แบบเต็ม → [`CONTRIBUTING.md`](../../CONTRIBUTING.md) ([Deutsch](CONTRIBUTING.de.md) · [Français](CONTRIBUTING.fr.md) · [简体中文](CONTRIBUTING.zh-CN.md) · [日本語](CONTRIBUTING.ja-JP.md) · [Português](CONTRIBUTING.pt-BR.md)).
+Contribution flow สำหรับ agent, code style และ PR bar แบบเต็ม → [`CONTRIBUTING.th.md`](CONTRIBUTING.th.md) ([Deutsch](CONTRIBUTING.de.md) · [Français](CONTRIBUTING.fr.md) · [简体中文](CONTRIBUTING.zh-CN.md) · [日本語](CONTRIBUTING.ja-JP.md) · [한국어](CONTRIBUTING.ko.md) · [Português](CONTRIBUTING.pt-BR.md)).
 
 ### 🏅 Open Design Fellow program
 
