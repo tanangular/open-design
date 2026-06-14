@@ -674,7 +674,7 @@ They carry a lot of the load — daily maintenance, review, and community suppor
   </tr>
 </table>
 
-Maintainer rules, promotion criteria, and the exit protocol → [`MAINTAINERS.md`](MAINTAINERS.md) (also [Deutsch](docs/i18n/MAINTAINERS.de.md) · [Français](docs/i18n/MAINTAINERS.fr.md) · [简体中文](docs/i18n/MAINTAINERS.zh-CN.md) · [日本語](docs/i18n/MAINTAINERS.ja-JP.md) · [Português](docs/i18n/MAINTAINERS.pt-BR.md)).
+Maintainer rules, promotion criteria, and the exit protocol → [`MAINTAINERS.md`](MAINTAINERS.md) (also [Deutsch](docs/i18n/MAINTAINERS.de.md) · [Français](docs/i18n/MAINTAINERS.fr.md) · [简体中文](docs/i18n/MAINTAINERS.zh-CN.md) · [日本語](docs/i18n/MAINTAINERS.ja-JP.md) · [한국어](docs/i18n/MAINTAINERS.ko.md) · [Português](docs/i18n/MAINTAINERS.pt-BR.md) · [ภาษาไทย](docs/i18n/MAINTAINERS.th.md)).
 
 ## Contributors
 
