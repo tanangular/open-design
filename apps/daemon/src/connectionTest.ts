@@ -36,10 +36,10 @@ import {
 } from '@open-design/platform';
 import { attachAcpSession } from './acp.js';
 import { attachPiRpcSession } from './pi-rpc.js';
-import { createClaudeStreamHandler } from './claude-stream.js';
+import { createClaudeStreamHandler } from './runtimes/claude-stream.js';
 import { diagnoseClaudeCliFailure } from './claude-diagnostics.js';
 import { createCopilotStreamHandler } from './copilot-stream.js';
-import { createJsonEventStreamHandler } from './json-event-stream.js';
+import { createJsonEventStreamHandler } from './runtimes/json-event-stream.js';
 import { agentCliEnvForAgent, validateAgentCliEnv } from './app-config.js';
 import {
   classifyAgentAuthFailure,
@@ -52,18 +52,21 @@ import {
   buildMaxCompletionTokensParam,
   buildOpenAIChatTokenParam,
   isUnsupportedMaxTokensError,
-} from './openai-chat-token-params.js';
-import { aihubmixHeaders } from './aihubmix.js';
+} from './integrations/openai-chat-token-params.js';
+import { aihubmixHeaders } from './integrations/aihubmix.js';
 import type { AgentCliEnvPrefs } from './app-config.js';
 import type { RuntimeAgentDef } from './runtimes/types.js';
 import { resolveModelForAgent } from './runtimes/models.js';
 import { preparePromptFileForAgent, type PreparedPromptFile } from './runtimes/prompt-file.js';
+import { configuredAllowedInternalHosts } from './origin-validation.js';
 import {
+  isAllowlistedInternalHost,
   isBlockedExternalApiHostname,
   isLoopbackApiHost,
   validateBaseUrl,
   type AgentTestRequest,
   type BaseUrlValidationResult,
+  type ValidateBaseUrlOptions,
   type ConnectionTestDiagnostics,
   type ConnectionTestKind,
   type ConnectionTestPhase,
@@ -72,7 +75,7 @@ import {
   type ParsedBaseUrl,
   type ProviderTestRequest,
 } from '@open-design/contracts/api/connectionTest';
-import { googleGenerateContentUrl } from './google-models.js';
+import { googleGenerateContentUrl } from './integrations/google-models.js';
 import { resolveAmrProfile } from './integrations/vela.js';
 
 export { validateBaseUrl } from '@open-design/contracts/api/connectionTest';
@@ -113,12 +116,18 @@ function looksLikeIpLiteral(hostname: string): boolean {
 export async function validateBaseUrlResolved(
   baseUrl: string,
   lookup: DnsLookupFn = defaultDnsLookup,
+  options: ValidateBaseUrlOptions = {},
 ): Promise<BaseUrlValidationResult> {
-  const sync = validateBaseUrl(baseUrl);
+  const sync = validateBaseUrl(baseUrl, options);
   if (sync.error || !sync.parsed) return sync;
 
   const hostname = sync.parsed.hostname.toLowerCase();
   if (isLoopbackApiHost(hostname)) return sync;
+  // Issue #3225 — an operator who trusts this hostname has opted it out of the
+  // guard entirely, so skip the resolved-IP block even though it points into
+  // private space. The sync check above already honored a literal-IP allowlist
+  // entry; this covers the hostname-that-resolves-private case.
+  if (isAllowlistedInternalHost(hostname, options.allowedInternalHosts)) return sync;
   if (looksLikeIpLiteral(hostname)) return sync;
 
   let addresses: DnsLookupAddress[];
@@ -131,12 +140,38 @@ export async function validateBaseUrlResolved(
   for (const addr of addresses) {
     const ip = String(addr.address).toLowerCase();
     if (isLoopbackApiHost(ip)) continue;
+    // A resolved address the operator explicitly allowlisted (they listed the
+    // IP rather than the hostname) is permitted; everything else in private
+    // space is still blocked.
+    if (isAllowlistedInternalHost(ip, options.allowedInternalHosts)) continue;
     if (isBlockedExternalApiHostname(ip)) {
       return { error: 'Internal IPs blocked', forbidden: true };
     }
   }
 
   return sync;
+}
+
+/**
+ * Validate a base URL that the USER deliberately configured as a provider
+ * endpoint (connection test, model discovery, BYOK chat dispatch). Identical
+ * to {@link validateBaseUrlResolved} except it honors the operator's
+ * `OD_ALLOWED_INTERNAL_HOSTS` allowlist (issue #3225), so an internally hosted
+ * gateway on an RFC1918 address can be reached when — and only when — the
+ * operator opted in.
+ *
+ * INVARIANT: use this ONLY for user-configured endpoints. URLs that arrive
+ * inside an upstream response (image/video download links) are
+ * attacker-controllable and MUST stay on the strict {@link assertExternalAssetUrl}
+ * / {@link validateBaseUrlResolved} path, which never consults the allowlist.
+ */
+export function validateUserProviderBaseUrl(
+  baseUrl: string,
+  lookup: DnsLookupFn = defaultDnsLookup,
+): Promise<BaseUrlValidationResult> {
+  return validateBaseUrlResolved(baseUrl, lookup, {
+    allowedInternalHosts: configuredAllowedInternalHosts(),
+  });
 }
 
 /**
@@ -803,6 +838,14 @@ function inspectProviderCompletion(
     };
   }
 
+  if (protocol === 'bedrock') {
+    return {
+      valid: false,
+      kind: 'unknown',
+      detail: 'AWS Bedrock BYOK connection tests need AWS credential signing, which is not supported by the current API-key smoke test.',
+    };
+  }
+
   return { valid: false };
 }
 
@@ -821,6 +864,55 @@ function statusToKind(status: number, detailText = ''): ConnectionTestKind {
   if (status === 429) return 'rate_limited';
   if (status >= 500) return 'upstream_unavailable';
   return 'unknown';
+}
+
+function isNvidiaDegradedProviderError(detailText: string): boolean {
+  return /\bDEGRADED\b/i.test(detailText) && /\bfunction\s+id\b/i.test(detailText);
+}
+
+function providerHttpErrorOverride(
+  protocol: ConnectionTestProtocol,
+  hostname: string,
+  status: number,
+  detailText: string,
+): { kind: ConnectionTestKind; detail: string } | null {
+  if (
+    protocol === 'openai' &&
+    status === 400 &&
+    hostname.toLowerCase() === 'integrate.api.nvidia.com' &&
+    isNvidiaDegradedProviderError(detailText)
+  ) {
+    return {
+      kind: 'upstream_unavailable',
+      detail:
+        'The selected NVIDIA model instance is currently unavailable at the provider. Try a different model or retry later.',
+    };
+  }
+  return null;
+}
+
+function classifyProviderHttpFailure(
+  protocol: ConnectionTestProtocol,
+  hostname: string,
+  status: number,
+  detailText: string,
+  secrets: string[],
+): { kind: ConnectionTestKind; detail: string } {
+  const redactedDetail = redactSecrets(detailText.slice(0, 240), secrets);
+  const override = providerHttpErrorOverride(
+    protocol,
+    hostname,
+    status,
+    redactedDetail,
+  );
+  if (override) return override;
+  const kind = statusToKind(status, redactedDetail);
+  const detail =
+    redactedDetail ||
+    (status === 404
+      ? 'HTTP 404 from provider; check the Base URL path.'
+      : '');
+  return { kind, detail };
 }
 
 function extractOpenAiModelIds(data: unknown): string[] {
@@ -1204,6 +1296,10 @@ function buildProviderCall(input: ProviderTestRequest): ProviderCallShape {
         },
       };
     }
+    case 'bedrock':
+      throw new Error(
+        'AWS Bedrock BYOK requires AWS credential signing; the current provider smoke test only supports API-key based providers.',
+      );
     default:
       throw new Error(`Unknown protocol: ${(input as { protocol?: string }).protocol}`);
   }
@@ -1229,7 +1325,7 @@ export async function testProviderConnection(
   const start = Date.now();
   const model = String(input.model ?? '');
   const normalizedInput = normalizeProviderTestInput(input);
-  const validated = await validateBaseUrlResolved(normalizedInput.baseUrl);
+  const validated = await validateUserProviderBaseUrl(normalizedInput.baseUrl);
   if (validated.error || !validated.parsed) {
     const kind: ConnectionTestKind = validated.forbidden ? 'forbidden' : 'invalid_base_url';
     return {
@@ -1332,15 +1428,13 @@ export async function testProviderConnection(
         });
         latencyMs = Date.now() - start;
       } else {
-        const redactedDetail = redactSecrets(detailText.slice(0, 240), [
-          input.apiKey,
-        ]);
-        const kind = statusToKind(response.status, redactedDetail);
-        const detail =
-          redactedDetail ||
-          (response.status === 404
-            ? 'HTTP 404 from provider; check the Base URL path.'
-            : '');
+        const { kind, detail } = classifyProviderHttpFailure(
+          input.protocol,
+          validated.parsed.hostname,
+          response.status,
+          detailText,
+          [input.apiKey],
+        );
         console.warn(
           `[test:provider] ${input.protocol} ${validated.parsed.hostname} model=${input.model} → ${response.status} in ${latencyMs}ms (${kind})${detail ? ` ${detail}` : ''}`,
         );
@@ -1466,15 +1560,13 @@ export async function testProviderConnection(
     } catch {
       // Ignore — we still report the status code.
     }
-    const redactedDetail = redactSecrets(detailText.slice(0, 240), [
-      input.apiKey,
-    ]);
-    const kind = statusToKind(response.status, redactedDetail);
-    const detail =
-      redactedDetail ||
-      (response.status === 404
-        ? 'HTTP 404 from provider; check the Base URL path.'
-        : '');
+    const { kind, detail } = classifyProviderHttpFailure(
+      input.protocol,
+      validated.parsed.hostname,
+      response.status,
+      detailText,
+      [input.apiKey],
+    );
     console.warn(
       `[test:provider] ${input.protocol} ${validated.parsed.hostname} model=${input.model} → ${response.status} in ${latencyMs}ms (${kind})${detail ? ` ${detail}` : ''}`,
     );
@@ -1522,14 +1614,56 @@ interface AgentSink {
   getText: () => string;
   getStderrTail: () => string;
   appendRawStdout: (chunk: string) => void;
+  getRawStdout: () => string;
   getRawStdoutTail: () => string;
+  sawTerminalCompletion: () => boolean;
   dispose: () => void;
+}
+
+function isTerminalCompletionStopReason(value: unknown): boolean {
+  return typeof value === 'string' && value.length > 0 && value !== 'tool_use';
+}
+
+function parseClaudeResultFrame(stdout: string): {
+  resultText: string;
+  stopReason: string | null;
+  isError: boolean;
+  subtype: string | null;
+} | null {
+  let parsed: {
+    resultText: string;
+    stopReason: string | null;
+    isError: boolean;
+    subtype: string | null;
+  } | null = null;
+  for (const line of stdout.split(/\r?\n/u)) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    try {
+      const obj = JSON.parse(trimmed) as Record<string, unknown>;
+      if (obj.type !== 'result') continue;
+      parsed = {
+        resultText: typeof obj.result === 'string' ? obj.result.trim() : '',
+        stopReason:
+          (typeof obj.stop_reason === 'string' && obj.stop_reason) ||
+          (typeof obj.terminal_reason === 'string' && obj.terminal_reason) ||
+          null,
+        isError: Boolean(obj.is_error),
+        subtype: typeof obj.subtype === 'string' ? obj.subtype : null,
+      };
+    } catch {
+      // Non-JSON stdout falls back to the normal diagnostic path.
+    }
+  }
+  return parsed;
 }
 
 export function createAgentSink(): AgentSink {
   let buffer = '';
   let stderrTail = '';
+  let rawStdout = '';
   let rawStdoutTail = '';
+  let terminalCompletionSeen = false;
   let debounceTimer: ReturnType<typeof setTimeout> | null = null;
   let resolveResult!: (value: AgentSinkResult) => void;
   let resolveStreamError!: (value: Error) => void;
@@ -1576,6 +1710,7 @@ export function createAgentSink(): AgentSink {
 
   const appendRawStdout = (chunk: string) => {
     if (typeof chunk === 'string' && chunk.length > 0) {
+      rawStdout = (rawStdout + chunk).slice(-16_384);
       rawStdoutTail = (rawStdoutTail + chunk).slice(-400);
     }
   };
@@ -1606,6 +1741,11 @@ export function createAgentSink(): AgentSink {
         consumeText(delta);
       } else if (type === 'text' && typeof text === 'string') {
         consumeText(text);
+      } else if (
+        (type === 'turn_end' || type === 'usage') &&
+        isTerminalCompletionStopReason(data.stopReason)
+      ) {
+        terminalCompletionSeen = true;
       }
       return;
     }
@@ -1635,7 +1775,9 @@ export function createAgentSink(): AgentSink {
     getText: () => buffer,
     getStderrTail: () => stderrTail,
     appendRawStdout,
+    getRawStdout: () => rawStdout,
     getRawStdoutTail: () => rawStdoutTail,
+    sawTerminalCompletion: () => terminalCompletionSeen,
     dispose: () => {
       if (debounceTimer) {
         clearTimeout(debounceTimer);
@@ -2010,8 +2152,8 @@ async function testAgentConnectionInternal(
   };
 
   try {
-    if (input.agentId === 'opencode') {
-      await prepareOpenCodeConnectionTestCwd(tempDir);
+    if (input.agentId === 'opencode' || input.agentId === 'mimo') {
+      if (input.agentId === 'opencode') await prepareOpenCodeConnectionTestCwd(tempDir);
     }
     let args: string[];
     try {
@@ -2030,10 +2172,10 @@ async function testAgentConnectionInternal(
       // fail on unrelated user-installed OpenCode plugins. `opencode run
       // --pure` keeps the smoke test isolated while regular chat runs retain
       // the user's full plugin environment.
-      if (input.agentId === 'opencode' && !args.includes('--pure')) {
+      if ((input.agentId === 'opencode' || input.agentId === 'mimo') && !args.includes('--pure')) {
         args.push('--pure');
       }
-      if (input.agentId === 'opencode' && !args.includes('--title')) {
+      if ((input.agentId === 'opencode' || input.agentId === 'mimo') && !args.includes('--title')) {
         args.push('--title', 'Connection test');
       }
     } catch (err) {
@@ -2179,6 +2321,20 @@ async function testAgentConnectionInternal(
       await delay(AGENT_STDOUT_DRAIN_MS);
       const latencyMs = Date.now() - start;
       const buffered = sink.getText().trim();
+      const claudeResult = input.agentId === 'claude'
+        ? parseClaudeResultFrame(sink.getRawStdout())
+        : null;
+      const claudeReportedSuccess =
+        !!claudeResult &&
+        !claudeResult.isError &&
+        claudeResult.subtype === 'success';
+      const claudeLateExitOne =
+        input.agentId === 'claude' &&
+        winner.code === 1 &&
+        winner.signal === null;
+      const parsedClaudeResultText =
+        claudeReportedSuccess ? claudeResult.resultText.trim() : '';
+      const visibleText = buffered || parsedClaudeResultText;
       // ACP agents that don't shut down on stdin.end() are terminated after a
       // clean prompt completion. Depending on the ACP bridge, this can surface
       // either as SIGTERM or as a normal code 130 teardown. For those exact
@@ -2201,19 +2357,28 @@ async function testAgentConnectionInternal(
           (winner.code === null && winner.signal === 'SIGTERM') ||
           (winner.code === 130 && winner.signal === null)
         );
+      const claudeCompletedTurn =
+        claudeLateExitOne &&
+        claudeReportedSuccess &&
+        (
+          sink.sawTerminalCompletion() ||
+          (
+            isTerminalCompletionStopReason(claudeResult.stopReason)
+          )
+        );
       const exitedCleanly =
-        (winner.code === 0 && !winner.signal) || acpForcedShutdown;
-      if (buffered) {
-        const rawSample = truncateSample(buffered);
+        (winner.code === 0 && !winner.signal) || acpForcedShutdown || claudeCompletedTurn;
+      if (visibleText) {
+        const rawSample = truncateSample(visibleText);
         const exitInfo = { code: winner.code, signal: winner.signal };
         if (rawSample && isLikelyModelErrorText(rawSample)) {
-          return resultFromAgentText(buffered, exitInfo);
+          return resultFromAgentText(visibleText, exitInfo);
         }
-        if (exitedCleanly) return resultFromAgentText(buffered, exitInfo);
+        if (exitedCleanly) return resultFromAgentText(visibleText, exitInfo);
       }
       const stderrTail = sink.getStderrTail().trim();
       const rawStdoutTail = sink.getRawStdoutTail().trim();
-      if (input.agentId === 'opencode' && exitedCleanly && rawStdoutTail) {
+      if ((input.agentId === 'opencode' || input.agentId === 'mimo') && exitedCleanly && rawStdoutTail) {
         const recoveredText = extractOpenCodeTextFromRawStdout(rawStdoutTail).trim();
         if (recoveredText) {
           return resultFromAgentText(recoveredText, {
@@ -2276,7 +2441,7 @@ async function testAgentConnectionInternal(
         exitCode: winner.code,
         signal: winner.signal,
         stderrTail,
-        stdoutTail: rawStdoutTail || buffered,
+        stdoutTail: sink.getRawStdout() || rawStdoutTail || visibleText,
         env,
         resolvedBin: executableResolution.selectedPath,
       });

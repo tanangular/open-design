@@ -72,7 +72,7 @@ type AgentEvent =
 
 ## 2. Detection strategy
 
-Run all adapters' `detect()` in parallel on daemon start, then cache results in `~/.open-design/agents.json` with a 24h TTL. Re-detect on daemon `SIGHUP`.
+Run all adapters' `detect()` in parallel on daemon start, then cache results through daemon-managed storage with a 24h TTL. This document MUST NOT define daemon data paths; read the root `AGENTS.md` section **Daemon data directory contract** before changing or documenting that storage.
 
 Each adapter uses **two signals**:
 
@@ -195,6 +195,7 @@ The adapter declares which strategy to use via `capabilities().nativeSkillLoadin
 ### 5.7 OpenCode / OpenClaw
 
 - Less-matured CLIs. Targeting P2. Expect bumps; adapter implementations will likely be the thinnest possible "shell out, parse output, synthesize events" approach.
+- OpenCode runs as `opencode run --format json` with the prompt on stdin. Newer OpenCode builds that advertise `--dangerously-skip-permissions` from `opencode run --help` receive that flag so headless runs do not stop on edit approval prompts; older builds keep the 1.3-compatible argv.
 
 ### 5.8 GitHub Copilot CLI
 
